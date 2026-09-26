@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
-import { planApi } from './api';
+import { planApi, snapshotApi, reviewUrl, copyText } from './api';
 import { distanceBetween, routePoints, validateRoute } from './geometry';
-import type { NoFlyZone, Point, RoutePlan, ValidationResult } from './types';
+import { formatDateTime, formatRelative } from './format';
+import type { NoFlyZone, Point, RoutePlan, SnapshotSummary, ValidationResult } from './types';
 
 const CANVAS = { width: 100, height: 70 };
 const ZONE_COLORS = ['#fb7185', '#f59e0b', '#a78bfa', '#38bdf8'];
@@ -45,10 +46,38 @@ export default function App() {
   const [activePlanId, setActivePlanId] = useState<string>();
   const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const [notice, setNotice] = useState('点击画布或使用左侧工具编辑航线');
+  const [snapshots, setSnapshots] = useState<SnapshotSummary[]>([]);
+  const [reviewTtl, setReviewTtl] = useState<number | null>(604800);
+  const [reviewBusy, setReviewBusy] = useState(false);
+  const [reviewError, setReviewError] = useState('');
+  const [activeSnapshot, setActiveSnapshot] = useState<SnapshotSummary>();
+  const [copiedSnapshot, setCopiedSnapshot] = useState(false);
+  const [confirmRevoke, setConfirmRevoke] = useState(false);
 
   useEffect(() => {
     planApi.list().then(({ plans }) => setSavedPlans(plans)).catch(() => setNotice('API 尚未启动，仍可在本地编辑方案'));
   }, []);
+
+  // 审查链接列表跟随当前方案加载；生成/撤销后显式刷新，状态（过期/撤销）以服务端为准
+  useEffect(() => {
+    if (!activePlanId) {
+      setSnapshots([]);
+      setActiveSnapshot(undefined);
+      return;
+    }
+    let cancelled = false;
+    snapshotApi
+      .list(activePlanId)
+      .then(({ snapshots: list }) => {
+        if (!cancelled) setSnapshots(list);
+      })
+      .catch(() => {
+        if (!cancelled) setSnapshots([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activePlanId]);
 
   useEffect(() => setValidation(validateRoute(plan)), [plan]);
 
@@ -120,7 +149,7 @@ export default function App() {
   const removeWaypoint = (index: number) => updatePlan({ waypoints: plan.waypoints.filter((_, waypointIndex) => waypointIndex !== index) });
   const removeZone = (id: string) => updatePlan({ noFlyZones: plan.noFlyZones.filter((zone) => zone.id !== id) });
 
-  const save = async () => {
+  const save = async (): Promise<RoutePlan | null> => {
     setSaveState('saving');
     try {
       const { plan: saved } = await planApi.save({ ...plan, id: activePlanId });
@@ -130,9 +159,11 @@ export default function App() {
       setSaveState('saved');
       setNotice('方案已保存到内存 API');
       window.setTimeout(() => setSaveState('idle'), 1800);
+      return saved;
     } catch {
       setSaveState('error');
       setNotice('保存失败：请确认后端运行在 http://localhost:4000');
+      return null;
     }
   };
 
@@ -140,6 +171,9 @@ export default function App() {
     setPlan(saved);
     setActivePlanId(saved.id);
     setDraftPolygon([]);
+    setActiveSnapshot(undefined);
+    setReviewError('');
+    setConfirmRevoke(false);
     setNotice(`已加载「${saved.name}」`);
   };
 
@@ -147,7 +181,71 @@ export default function App() {
     setPlan({ ...initialPlan, name: '未命名航线', id: undefined, waypoints: [], noFlyZones: [] });
     setActivePlanId(undefined);
     setDraftPolygon([]);
+    setSnapshots([]);
+    setActiveSnapshot(undefined);
+    setReviewError('');
+    setConfirmRevoke(false);
     setNotice('已新建空白方案');
+  };
+
+  const refreshSnapshots = async (planId: string) => {
+    try {
+      const { snapshots: list } = await snapshotApi.list(planId);
+      setSnapshots(list);
+      return list;
+    } catch {
+      return undefined;
+    }
+  };
+
+  // 生成只读审查链接：先保存最新编辑（保证快照即所见），再固化快照
+  const generateReview = async (force: boolean) => {
+    setReviewBusy(true);
+    setReviewError('');
+    try {
+      const saved = await save();
+      if (!saved) {
+        setReviewError('方案保存失败，无法生成审查链接');
+        return;
+      }
+      const result = await snapshotApi.create(saved.id!, { ttlSeconds: reviewTtl, force });
+      const list = await refreshSnapshots(saved.id!);
+      const current = list?.find((item) => item.token === result.snapshot.token) ?? result.snapshot;
+      setActiveSnapshot(current);
+      setConfirmRevoke(false);
+      setNotice(result.reused ? '现有审查链接仍有效，已复用（内容未变化）' : '只读审查链接已生成');
+    } catch (error) {
+      setReviewError((error as Error).message || '生成审查链接失败');
+    } finally {
+      setReviewBusy(false);
+    }
+  };
+
+  // 撤销只作用于已发出的快照，原方案不受影响；撤销后只读链接立即打开失效页
+  const revokeReview = async () => {
+    if (!activeSnapshot || !activePlanId) return;
+    setReviewBusy(true);
+    setReviewError('');
+    try {
+      await snapshotApi.revoke(activePlanId, activeSnapshot.token, activeSnapshot.manageToken);
+      const list = await refreshSnapshots(activePlanId);
+      const updated = list?.find((item) => item.token === activeSnapshot.token);
+      if (updated) setActiveSnapshot(updated);
+      setConfirmRevoke(false);
+      setNotice('审查链接已撤销，对方将看到失效页面');
+    } catch (error) {
+      setReviewError(`撤销失败：${(error as Error).message || '请稍后重试'}`);
+    } finally {
+      setReviewBusy(false);
+    }
+  };
+
+  const copyReview = async () => {
+    if (!activeSnapshot) return;
+    if (await copyText(reviewUrl(activeSnapshot.token))) {
+      setCopiedSnapshot(true);
+      window.setTimeout(() => setCopiedSnapshot(false), 1600);
+    }
   };
 
   const toolItems: Array<{ id: Tool; label: string; icon: string; hint: string }> = [
@@ -239,6 +337,67 @@ export default function App() {
         <aside className="inspector">
           <section className="metric-card primary-metric"><div className="metric-label">航线总距离</div><div className="metric-value">{formatDistance(validation.distance)}</div><div className="metric-caption">{points.length - 1} 个航段 · 预计 18 分钟</div><div className="metric-spark"><span style={{ height: '35%' }} /><span style={{ height: '55%' }} /><span style={{ height: '42%' }} /><span style={{ height: '75%' }} /><span style={{ height: '65%' }} /><span style={{ height: '92%' }} /><span style={{ height: '78%' }} /><span style={{ height: '100%' }} /></div></section>
           <section className={`validation-card ${validation.valid ? 'is-valid' : 'has-error'}`}><div className="validation-heading"><span className="validation-icon">{validation.valid ? '✓' : '!'}</span><div><b>{validation.valid ? '校验通过' : '需要调整'}</b><small>{validation.valid ? '未发现越界或穿越禁飞区' : '请查看下方风险项'}</small></div></div>{validation.issues.length > 0 && <div className="issue-list">{validation.issues.slice(0, 4).map((issue, index) => <div className="issue-item" key={`${issue.message}-${index}`}><span>×</span>{issue.message}</div>)}</div>}</section>
+          <section className="review-card">
+            <div className="section-title"><span>只读审查链接</span><small>提交给安全员复核</small></div>
+            <p className="review-hint">生成时固化当前方案坐标、禁飞区与校验结果；之后继续编辑不会改变已发出的快照。</p>
+            <div className="review-form-row">
+              <select className="review-ttl" value={reviewTtl === null ? 'none' : String(reviewTtl)} onChange={(event) => setReviewTtl(event.target.value === 'none' ? null : Number(event.target.value))} aria-label="链接有效期">
+                <option value="86400">1 天后过期</option>
+                <option value="604800">7 天后过期</option>
+                <option value="2592000">30 天后过期</option>
+                <option value="none">长期有效（需手动撤销）</option>
+              </select>
+              <button className="primary-button review-generate" disabled={reviewBusy} onClick={() => generateReview(false)}>{reviewBusy ? '处理中…' : '生成审查链接'}</button>
+            </div>
+            {reviewError && <div className="review-error">× {reviewError}</div>}
+            {activeSnapshot && activeSnapshot.status === 'active' && (
+              <div className="review-link-box">
+                <div className="review-link-meta">
+                  <span className="review-link-label">审查地址（只读）</span>
+                  <small>创建于 {formatDateTime(activeSnapshot.createdAt)}{activeSnapshot.expiresAt ? ` · ${formatRelative(activeSnapshot.expiresAt)}过期` : ' · 长期有效'}</small>
+                </div>
+                <div className="review-link-url">{reviewUrl(activeSnapshot.token)}</div>
+                <div className="review-link-actions">
+                  <button className="outline-action review-mini" onClick={copyReview}>{copiedSnapshot ? '已复制 ✓' : '复制链接'}</button>
+                  <a className="outline-action review-mini" href={reviewUrl(activeSnapshot.token)} target="_blank" rel="noreferrer">打开预览</a>
+                  {!confirmRevoke && <button className="outline-action review-mini danger" onClick={() => setConfirmRevoke(true)}>撤销链接</button>}
+                </div>
+                {confirmRevoke && (
+                  <div className="revoke-confirm">
+                    <span>撤销后所有已发出的链接立即失效，确定？</span>
+                    <div>
+                      <button className="primary-button danger-button" disabled={reviewBusy} onClick={revokeReview}>确认撤销</button>
+                      <button className="ghost-button" onClick={() => setConfirmRevoke(false)}>取消</button>
+                    </div>
+                  </div>
+                )}
+                <button className="review-force" disabled={reviewBusy} onClick={() => generateReview(true)}>内容已修改？强制重新生成一条</button>
+              </div>
+            )}
+            {activeSnapshot && activeSnapshot.status !== 'active' && (
+              <div className={`review-status-box ${activeSnapshot.status}`}>
+                {activeSnapshot.status === 'revoked' ? '该链接已被撤销' : '该链接已过期'}，可重新生成一条。
+              </div>
+            )}
+            {snapshots.length > 0 && (
+              <div className="review-history">
+                <div className="section-title"><span>历史快照</span><strong>{snapshots.length}</strong></div>
+                {snapshots.slice(0, 5).map((item) => (
+                  <button
+                    key={item.token}
+                    className={`snapshot-row ${activeSnapshot?.token === item.token ? 'active' : ''}`}
+                    onClick={() => { setActiveSnapshot(item); setConfirmRevoke(false); }}
+                  >
+                    <span className={`snapshot-dot ${item.status}`} title={item.status} />
+                    <span className="snapshot-date">{formatDateTime(item.createdAt)}</span>
+                    <small className={`snapshot-status ${item.status}`}>
+                      {item.status === 'active' ? (item.expiresAt ? `${formatRelative(item.expiresAt)}过期` : '有效') : item.status === 'revoked' ? '已撤销' : '已过期'}
+                    </small>
+                  </button>
+                ))}
+              </div>
+            )}
+          </section>
           <section className="inspector-section"><div className="section-title"><span>航线摘要</span><small>实时计算</small></div><div className="summary-list"><div><span>起点</span><b>{pointText(plan.start)}</b></div><div><span>终点</span><b>{pointText(plan.end)}</b></div><div><span>航点</span><b>{plan.waypoints.length} 个</b></div><div><span>禁飞区</span><b>{plan.noFlyZones.length} 个</b></div></div></section>
           <section className="inspector-section"><div className="section-title"><span>快捷操作</span></div><button className="outline-action" onClick={() => { updatePlan({ waypoints: [] }); setNotice('已清空所有航点'); }}>清空航点</button><button className="outline-action" onClick={() => { updatePlan({ noFlyZones: [] }); setNotice('已移除所有禁飞区'); }}>移除禁飞区</button><button className="outline-action" onClick={() => setValidation(validateRoute(plan))}>重新校验路径 <span>⌘↵</span></button></section>
           <section className="api-note"><div className="api-icon">⌁</div><div><b>内存 REST API</b><small>保存到当前 Node.js 进程，重启后清空</small></div></section>

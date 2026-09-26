@@ -32,3 +32,33 @@ export type ValidationResult = {
   distance: number;
   issues: ValidationIssue[];
 };
+
+export type SnapshotStatus = 'active' | 'expired' | 'revoked';
+
+/** 管理面看到的快照摘要（含撤销凭据，仅用于同一方案的管理操作） */
+export type SnapshotSummary = {
+  id: string;
+  token: string;
+  planId: string;
+  planName: string;
+  contentHash: string;
+  sizeBytes: number;
+  status: SnapshotStatus;
+  createdAt: string;
+  expiresAt: string | null;
+  revokedAt: string | null;
+  manageToken: string;
+};
+
+/** 只读审查页的数据：没有任何可用于写操作的字段（无 manageToken） */
+export type ReviewSnapshot = {
+  token: string;
+  createdAt: string;
+  expiresAt: string | null;
+  sourcePlan: { id: string; name: string };
+  plan: RoutePlan;
+  validation: ValidationResult;
+  sizeBytes: number;
+};
+
+export type ReviewErrorReason = 'not-found' | 'expired' | 'revoked';
