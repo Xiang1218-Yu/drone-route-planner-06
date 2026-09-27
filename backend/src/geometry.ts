@@ -1,17 +1,6 @@
-import type { NoFlyZone, Point, RoutePlan } from './types.js';
+import type { NoFlyZone, Point, RouteIssue, RoutePlan, RouteValidation } from './types.js';
 
-export type RouteIssue = {
-  type: 'out-of-bounds' | 'no-fly-zone';
-  message: string;
-  segmentIndex?: number;
-  zoneId?: string;
-};
-
-export type RouteValidation = {
-  valid: boolean;
-  distance: number;
-  issues: RouteIssue[];
-};
+export type { RouteIssue, RouteValidation };
 
 const EPSILON = 1e-8;
 

@@ -11,6 +11,7 @@
 - 路径校验：检查节点是否越界、航段是否与禁飞多边形/矩形区域相交；风险航段使用红色虚线高亮。
 - 距离计算：实时计算航线总距离，并展示航段数量。
 - 方案管理：通过 REST API 保存、读取和删除方案；当前使用进程内存存储，服务重启后数据清空。
+- 只读审查链接：为已保存方案生成不可变快照（含当时的坐标、禁飞区与服务端校验结果），输出短链接 `#/r/<token>` 供另一位安全员只读复核；支持设置有效期、复制地址与随时撤销，后续编辑不会改变已发出的快照。
 - 纯 TypeScript：前端与后端均没有使用纯 JavaScript 源文件。
 
 ## 目录结构
@@ -21,6 +22,7 @@
 │   ├── src/
 │   │   ├── geometry.ts
 │   │   ├── server.ts
+│   │   ├── snapshotStore.ts
 │   │   ├── store.ts
 │   │   └── types.ts
 │   ├── package.json
@@ -29,8 +31,14 @@
 │   ├── src/
 │   │   ├── api.ts
 │   │   ├── App.tsx
+│   │   ├── format.ts
 │   │   ├── geometry.ts
 │   │   ├── main.tsx
+│   │   ├── ReviewPage.tsx
+│   │   ├── reviewApi.ts
+│   │   ├── reviewLinks.ts
+│   │   ├── RouteCanvas.tsx
+│   │   ├── snapshotApi.ts
 │   │   ├── styles.css
 │   │   └── types.ts
 │   ├── index.html
@@ -105,6 +113,34 @@ npm start
 ### `DELETE /api/plans/:id`
 
 删除指定方案。
+
+## 只读审查链接
+
+用于「提交前由另一位安全员只读复核」的场景：把当前方案冻结成不可变快照，生成短链接发给复核人；复核人打开后是明确的只读视图，可以看到快照创建时间、来源方案和冻结时的校验结果（当前风险）。后续对原方案的编辑、甚至删除，都不会改变已发出的快照。
+
+### `POST /api/plans/:id/snapshots`
+
+为指定方案创建快照。请求体：`{ "ttlHours": 168 }`（`0` 表示长期有效，默认 7 天，最大 90 天）。支持 `Idempotency-Key` 请求头做幂等去重：同一方案 + 同一幂等键重复提交会返回首次创建的快照（`reused: true`），重复点击 / 网络重试不会产生多份快照。
+
+- 快照内容：创建时的方案深拷贝（服务端冻结）+ 当时服务端计算的校验结果。
+- 返回快照元信息与 16 位短令牌 `token`，审查地址为 `<前端地址>/#/r/<token>`。
+- 边界：`409 SNAPSHOT_LIMIT`（单方案有效快照达到上限，默认 20 个）、`413 SNAPSHOT_TOO_LARGE`（方案体超过快照大小上限，默认 256 KB）、`400 INVALID_TTL`。
+
+### `GET /api/plans/:id/snapshots`
+
+列出指定方案的全部快照（含已撤销 / 已过期），供编辑侧管理。
+
+### `DELETE /api/snapshots/:id`
+
+撤销指定快照，立即生效且幂等；撤销后审查链接返回 `410 SNAPSHOT_REVOKED`。
+
+### `GET /api/review/:token`
+
+公开只读接口，返回快照的方案、冻结的校验结果与来源信息（`source.exists` 表示源方案是否仍在、`source.updatedAt` 可用于判断源方案在快照后是否又被编辑过）。该接口仅接受 `GET`，其它方法一律 `405`；令牌不存在返回 `404`，已撤销 / 已过期返回 `410`。
+
+前端只读页（`#/r/<token>`）按需加载，编辑工作台及其编辑 / 撤销 API 不会进入只读页的初始包；链接失效（撤销、过期、不存在）时展示明确的失效页面。
+
+相关环境变量：`SNAPSHOT_MAX_PER_PLAN`（默认 20）、`SNAPSHOT_MAX_BYTES`（默认 262144）、`SNAPSHOT_DEFAULT_TTL_HOURS`（默认 168）。
 
 ## 说明
 
